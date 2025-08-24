@@ -1,6 +1,9 @@
 use bevy::prelude::*;
+use bevy::math::IVec2;
 use noise::{NoiseFn, Perlin};
+use rand::seq::SliceRandom;
 use rand::Rng;
+use std::collections::HashSet;
 
 // --- Constants ---
 const GRID_WIDTH: usize = 100;
@@ -10,6 +13,10 @@ const GAP_SIZE: f32 = 1.0; // Gap between blocks
 
 const NAVIGABLE_COLOR: Color = Color::GRAY;
 const NON_NAVIGABLE_COLOR: Color = Color::WHITE;
+const PATH_COLOR: Color = Color::rgba(1.0, 0.4, 0.4, 0.8); // Pale red
+
+// --- Path Generation Constants ---
+const PATH_LENGTH: usize = 500;
 
 // Calculate window dimensions based on grid size
 const WINDOW_WIDTH: f32 = (BLOCK_SIZE + GAP_SIZE) * GRID_WIDTH as f32;
@@ -28,7 +35,11 @@ struct GridCell {
     y: usize,
 }
 
-// --- Resources ---//
+// --- Resources ---
+
+/// A resource to hold the runner's path as a sequence of grid coordinates.
+#[derive(Resource, Default)]
+struct RunnerPath(Vec<IVec2>);
 
 /// A resource to hold the state of the grid.
 #[derive(Resource)]
@@ -87,12 +98,14 @@ fn main() {
             }),
             ..default()
         }))
+        .init_resource::<RunnerPath>()
         .insert_resource(Grid::new(GRID_WIDTH, GRID_HEIGHT))
         .add_systems(Startup, (setup_camera, setup_grid, setup_ui))
         .add_systems(
             Update,
             (
                 button_system,
+                draw_path_system,
                 // This system runs only when the Grid resource has changed.
                 // This is an optimization to avoid redrawing the grid every frame.
                 color_grid_cells.run_if(resource_changed::<Grid>),
@@ -107,9 +120,14 @@ fn setup_camera(mut commands: Commands) {
 }
 
 /// Spawns the grid of sprites, one for each cell.
-fn setup_grid(mut commands: Commands, mut grid: ResMut<Grid>) {
+fn setup_grid(
+    mut commands: Commands,
+    mut grid: ResMut<Grid>,
+    mut path: ResMut<RunnerPath>,
+) {
     // Randomize the grid on startup for an initial pattern
     grid.randomize();
+    path.0 = generate_path(&grid, PATH_LENGTH);
 
     let total_width = GRID_WIDTH as f32 * (BLOCK_SIZE + GAP_SIZE);
     let total_height = GRID_HEIGHT as f32 * (BLOCK_SIZE + GAP_SIZE);
@@ -199,12 +217,14 @@ fn button_system(
         (Changed<Interaction>, With<Button>),
     >,
     mut grid: ResMut<Grid>,
+    mut path: ResMut<RunnerPath>,
 ) {
     for (interaction, mut color) in &mut interaction_query {
         match *interaction {
             Interaction::Pressed => {
                 *color = Color::rgb(0.35, 0.75, 0.35).into(); // Green when pressed
                 grid.randomize();
+                path.0 = generate_path(&grid, PATH_LENGTH);
             }
             Interaction::Hovered => {
                 *color = Color::rgb(0.25, 0.25, 0.25).into(); // Lighter grey on hover
@@ -214,4 +234,118 @@ fn button_system(
             }
         }
     }
+}
+
+/// Generates a random path (walk) on navigable tiles.
+fn generate_path(grid: &Grid, length: usize) -> Vec<IVec2> {
+    let mut rng = rand::thread_rng();
+
+    // Find all navigable tiles to use as potential starting points.
+    let navigable_tiles: Vec<IVec2> = (0..grid.height)
+        .flat_map(|y| (0..grid.width).map(move |x| IVec2::new(x as i32, y as i32)))
+        .filter(|pos| grid.cells[grid.get_index(pos.x as usize, pos.y as usize)])
+        .collect();
+
+    if navigable_tiles.is_empty() {
+        return vec![]; // No place to walk.
+    }
+
+    let mut path = Vec::with_capacity(length);
+    let mut visited = HashSet::new();
+
+    // 1. Find a random starting position and add it to the path.
+    let start_pos = *navigable_tiles.choose(&mut rng).unwrap();
+    path.push(start_pos);
+    visited.insert(start_pos);
+
+    let mut current_pos = start_pos;
+
+    // Define 8-directional neighbors (including diagonals).
+    const NEIGHBORS: [IVec2; 8] = [
+        IVec2::new(-1, 1), IVec2::new(0, 1), IVec2::new(1, 1),
+        IVec2::new(-1, 0),                  IVec2::new(1, 0),
+        IVec2::new(-1, -1), IVec2::new(0, -1), IVec2::new(1, -1),
+    ];
+
+    // 2. Perform the first step randomly to establish an initial direction.
+    let first_step_neighbors: Vec<IVec2> = NEIGHBORS.iter()
+        .map(|&offset| current_pos + offset)
+        .filter(|&p| {
+            p.x >= 0 && p.x < grid.width as i32 && p.y >= 0 && p.y < grid.height as i32
+            && grid.cells[grid.get_index(p.x as usize, p.y as usize)]
+        })
+        .collect();
+
+    let mut last_direction = if let Some(&next_pos) = first_step_neighbors.choose(&mut rng) {
+        path.push(next_pos);
+        visited.insert(next_pos);
+        current_pos = next_pos;
+        next_pos - start_pos
+    } else {
+        return path; // Nowhere to go from the start.
+    };
+
+    // 3. Perform a biased random walk for the rest of the path.
+    for _ in 2..length {
+        let weighted_neighbors: Vec<(IVec2, f32)> = NEIGHBORS.iter()
+            .map(|&offset| current_pos + offset)
+            .filter(|&p| {
+                // Check if the neighbor is within grid bounds.
+                p.x >= 0 && p.x < grid.width as i32 && p.y >= 0 && p.y < grid.height as i32
+                // Check if the tile is navigable.
+                && grid.cells[grid.get_index(p.x as usize, p.y as usize)]
+                // Check that we haven't visited this tile yet in this path.
+                && !visited.contains(&p)
+            })
+            .map(|p| {
+                let move_dir = (p - current_pos).as_vec2().normalize_or_zero();
+                let last_dir = last_direction.as_vec2().normalize_or_zero();
+                let dot_product = move_dir.dot(last_dir);
+                // This formula creates a weight. Forward moves (dot ≈ 1) are heavily favored.
+                // Sideways moves (dot ≈ 0) are neutral. Backward moves (dot ≈ -1) are heavily disfavored.
+                let weight = (1.0 + dot_product).powi(4);
+                (p, weight)
+            })
+            .collect();
+
+        if let Ok(choice) = weighted_neighbors.choose_weighted(&mut rng, |item| item.1) {
+            let next_pos = choice.0;
+            last_direction = next_pos - current_pos;
+            current_pos = next_pos;
+            path.push(current_pos);
+            visited.insert(current_pos);
+        } else {
+            // If we hit a dead end, stop generating the path.
+            break;
+        }
+    }
+
+    path
+}
+
+/// Converts grid coordinates (e.g., 0,0) to world coordinates (e.g., -350.0, -350.0).
+fn grid_to_world(grid_pos: IVec2) -> Vec3 {
+    let total_width = GRID_WIDTH as f32 * (BLOCK_SIZE + GAP_SIZE);
+    let total_height = GRID_HEIGHT as f32 * (BLOCK_SIZE + GAP_SIZE);
+    let start_x = -total_width / 2.0 + BLOCK_SIZE / 2.0;
+    let start_y = -total_height / 2.0 + BLOCK_SIZE / 2.0;
+
+    let x_pos = start_x + grid_pos.x as f32 * (BLOCK_SIZE + GAP_SIZE);
+    let y_pos = start_y + grid_pos.y as f32 * (BLOCK_SIZE + GAP_SIZE);
+
+    // Use a Z-value of 1.0 to ensure the path is drawn on top of the grid sprites.
+    Vec3::new(x_pos, y_pos, 1.0)
+}
+
+/// Draws the runner's path using gizmos.
+fn draw_path_system(path: Res<RunnerPath>, mut gizmos: Gizmos) {
+    // We need at least two points to draw a line.
+    if path.0.len() < 2 {
+        return;
+    }
+
+    // Create a polyline from the waypoints.
+    // Note: Bevy's Gizmos do not support dashed lines out of the box. This will be a solid line.
+    let world_points = path.0.iter().map(|&p| grid_to_world(p));
+    gizmos.linestrip(world_points, PATH_COLOR);
 }
