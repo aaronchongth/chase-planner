@@ -1,0 +1,9 @@
+[package]
+name = "bevy_grid_world"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bevy = "0.13.2"
+noise = "0.8.2"
+rand = "0.8.5"
